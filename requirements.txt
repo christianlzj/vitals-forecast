@@ -30,7 +30,6 @@ matplotlib-inline==0.1.6
 multidict==6.7.1
 nest-asyncio==1.6.0
 numpy==2.4.3
-packaging==23.2
 pandas==3.0.1
 parso==0.8.3
 patsy==1.0.2
