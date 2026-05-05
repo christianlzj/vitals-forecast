@@ -1,10 +1,10 @@
 import numpy as np
 import pandas as pd
-from dataset import process_dataset, DiffusionTimeSeriesDataset
+from dataset import process_dataset, DiffusionTimeSeriesDataset, process_waveform_dataset, DiffusionTimeSeriesWaveformDataset, process_clinical_dataset, DiffusionTimeSeriesClinicalConditionedDataset
 import torch
 from torch.optim import Adam, AdamW
 from torch.utils.data import DataLoader
-from scaler import VitalScaler
+from scaler import VitalScaler, WaveformScaler
 import joblib
 from tqdm import tqdm
 from model import DiffusionForecaster
@@ -13,18 +13,24 @@ import torch.nn.functional as F
 from utils import compute_mae, compute_crps
 import matplotlib.pyplot as plt
 import os
+import random
 
 #######################
 #       TRAIN
-#######################x
-def train(model, train_loader, optimizer, diff_scheduler, model_save_path, train_state_save_path, epoch, epochs, device):
+#######################
+def train(model, train_loader, waveform_conditioning, clinical_conditioning, optimizer, diff_scheduler, model_save_path, train_state_save_path, epoch, epochs, device):
   model.train()
   total_loss = 0.0
 
   # train model for 1 epoch
 
   for idx, batch in tqdm(enumerate(train_loader), total=len(train_loader), desc=f"Epoch {epoch+1}/{epochs}"):
-    encoder_target, encoder_mask, encoder_delta, decoder_target, decoder_mask, decoder_delta = batch
+    if waveform_conditioning:
+      encoder_target, encoder_mask, encoder_delta, decoder_target, decoder_mask, decoder_delta, waveform_values = batch
+    elif clinical_conditioning:
+      encoder_target, encoder_mask, encoder_delta, decoder_target, decoder_mask, decoder_delta, clinical_embeddings = batch
+    else:
+      encoder_target, encoder_mask, encoder_delta, decoder_target, decoder_mask, decoder_delta = batch
 
     encoder_target = encoder_target.to(device)
     encoder_mask = encoder_mask.to(device)
@@ -32,6 +38,17 @@ def train(model, train_loader, optimizer, diff_scheduler, model_save_path, train
     decoder_target = decoder_target.to(device)
     decoder_mask = decoder_mask.to(device)
     decoder_delta = decoder_delta.to(device)
+
+    if waveform_conditioning:
+      waveform_values = waveform_values.to(device)
+    else:
+      waveform_values = None
+
+    if clinical_conditioning:
+      clinical_embeddings = clinical_embeddings.to(device)
+    else:
+      clinical_embeddings = None
+
 
     B = encoder_target.shape[0]
 
@@ -45,7 +62,7 @@ def train(model, train_loader, optimizer, diff_scheduler, model_save_path, train
     noisy_decoder_target = diff_scheduler.add_noise(decoder_target, t, noise)
 
     # 4. Predict noise
-    eps_hat = model(noisy_decoder_target, encoder_target, encoder_mask, encoder_delta, t)
+    eps_hat = model(noisy_decoder_target, encoder_target, encoder_mask, encoder_delta, t, waveform_values, clinical_embeddings)
 
     # 4.2 Predict x_0
     alpha_bar = diff_scheduler.alpha_cumprod[t].view(-1,1,1)
@@ -89,7 +106,7 @@ def train(model, train_loader, optimizer, diff_scheduler, model_save_path, train
 #      EVALUATE
 #######################
 def sample_future_ddim(
-    model, scaler, encoder_target, encoder_mask, encoder_delta, diff_scheduler, num_steps=50, eta=0.2):
+    model, scaler, encoder_target, encoder_mask, encoder_delta, diff_scheduler, waveform_values=None, clinical_embeddings=None, num_steps=50, eta=0.2):
     """
     DDIM sampler: can be deterministic (eta=0) or partially stochastic (0<eta<=1)
     """
@@ -120,7 +137,7 @@ def sample_future_ddim(
           t_batch = torch.full((B,), t, device=device, dtype=torch.long)
           
           # predict noise
-          eps_hat = model(future, encoder_target, encoder_mask, encoder_delta, t_batch)
+          eps_hat = model(future, encoder_target, encoder_mask, encoder_delta, t_batch, waveform_values, clinical_embeddings)
           
           # predicted x_0
           alpha_t = alpha_cum[t]
@@ -145,7 +162,7 @@ def sample_future_ddim(
     return future_inv
 
 
-def sample_future(model, scaler, encoder_target, encoder_mask, encoder_delta, diff_scheduler, num_steps=50, eta=0.0):
+def sample_future(model, scaler, encoder_target, encoder_mask, encoder_delta, diff_scheduler, waveform_values=None, clinical_embeddings=None, num_steps=50, eta=0.0):
     """
     encoder_target: [B, T_past, num_vitals]
     encoder_mask: [B, T_past, num_vitals]
@@ -168,7 +185,7 @@ def sample_future(model, scaler, encoder_target, encoder_mask, encoder_delta, di
           t_batch = torch.full((B,), t, device=device, dtype=torch.long)
 
           # predict noise
-          eps_hat = model(future, encoder_target, encoder_mask, encoder_delta, t_batch)
+          eps_hat = model(future, encoder_target, encoder_mask, encoder_delta, t_batch, waveform_values, clinical_embeddings)
 
           alpha = diff_scheduler.alphas[t].to(device)
           alpha_bar = diff_scheduler.alpha_cumprod[t].to(device)
@@ -227,7 +244,7 @@ def plot_forecast(x_past, samples, target, save_path):
     plt.savefig(save_path)
     plt.close()
 
-def evaluate(model, scaler, test_loader, diff_scheduler, epoch, log_path, vitals, device, num_samples=10): #5
+def evaluate(model, scaler, test_loader, waveform_conditioning, clinical_conditioning, diff_scheduler, epoch, log_path, vitals, device, num_samples=10): #5
 
   model.eval()
 
@@ -239,10 +256,19 @@ def evaluate(model, scaler, test_loader, diff_scheduler, epoch, log_path, vitals
 
   count = 0
 
+
+  rand_idx = random.randint(1, len(test_loader)) - 1
+
   for idx, batch in tqdm(enumerate(test_loader), total=len(test_loader), desc=f"Evaluating: "):
-    if idx > 0:
-      break
-    encoder_target, encoder_mask, encoder_delta, decoder_target, decoder_mask, decoder_delta = batch
+    if idx > rand_idx or idx < rand_idx:
+      continue
+
+    if waveform_conditioning:
+      encoder_target, encoder_mask, encoder_delta, decoder_target, decoder_mask, decoder_delta, waveform_values = batch
+    elif clinical_conditioning:
+      encoder_target, encoder_mask, encoder_delta, decoder_target, decoder_mask, decoder_delta, clinical_embeddings = batch
+    else:
+      encoder_target, encoder_mask, encoder_delta, decoder_target, decoder_mask, decoder_delta = batch
 
     encoder_target = encoder_target.to(device)
     encoder_mask = encoder_mask.to(device)
@@ -251,13 +277,24 @@ def evaluate(model, scaler, test_loader, diff_scheduler, epoch, log_path, vitals
     decoder_mask = decoder_mask.to(device)
     decoder_delta = decoder_delta.to(device)
 
+    if waveform_conditioning:
+      waveform_values = waveform_values.to(device)
+    else:
+      waveform_values = None
+
+    if clinical_conditioning:
+      clinical_embeddings = clinical_embeddings.to(device)
+    else:
+      clinical_embeddings = None
+
+
     B = encoder_target.shape[0]
 
     # === Generate multiple samples ===
     samples = []
     for _ in range(num_samples):
         # pred = sample_future(model, scaler, encoder_target, encoder_mask, encoder_delta, diff_scheduler, num_steps=diff_scheduler.T)
-        pred = sample_future_ddim(model, scaler, encoder_target, encoder_mask, encoder_delta, diff_scheduler, num_steps=50, eta=0.0)
+        pred = sample_future_ddim(model, scaler, encoder_target, encoder_mask, encoder_delta, diff_scheduler, waveform_values, clinical_embeddings, num_steps=50, eta=0.0)
         samples.append(pred)
 
     samples = torch.stack(samples)  # [S, B, T, D]
@@ -272,17 +309,18 @@ def evaluate(model, scaler, test_loader, diff_scheduler, epoch, log_path, vitals
     crps = compute_crps(samples.detach().cpu().numpy(), decoder_target_inv, vitals=vitals)
 
     for vital in vitals:
-      total_maes[vital] += mae[vital]
-      total_crpss[vital] += crps[vital]
+      total_maes[vital] += np.mean(mae[vital])
+      total_crpss[vital] += np.mean(crps[vital])
 
     count += 1
 
-  enocder_target = encoder_target[0].detach().cpu().numpy()
-  enocder_target_inv = scaler.inverse(enocder_target)
-  for i in range(len(vitals)):
-    vital = vitals[i]
-    x_past = enocder_target_inv[:, i]
-    plot_forecast(x_past=x_past, samples=samples[:, 0, :, i], target=decoder_target_inv[0, :, i], save_path=f'{log_path}/figures/{vital}/epoch_{epoch}.png')
+    # ==== Plot ====
+    enocder_target = encoder_target[0].detach().cpu().numpy()
+    enocder_target_inv = scaler.inverse(enocder_target)
+    for i in range(len(vitals)):
+      vital = vitals[i]
+      x_past = enocder_target_inv[:, i]
+      plot_forecast(x_past=x_past, samples=samples[:, 0, :, i], target=decoder_target_inv[0, :, i], save_path=f'{log_path}/figures/{vital}/epoch_{epoch}.png')
 
   mean_maes = {}
   mean_crpss = {}
@@ -302,36 +340,105 @@ def evaluate(model, scaler, test_loader, diff_scheduler, epoch, log_path, vitals
 #######################
 
 #training variables
-save_path = '../../models/Diffusion'
+use_pretrained_vital_encoder_weights = True # CHANGE
+
+use_waveform_data = False # CHANGE
+waveform_conditioning = False # CHANGE
+
+use_clinical_data = False  # CHANGE
+clinical_conditioning = False  # CHANGE
+
+modifier = ""
+if use_waveform_data:
+  modifier += "/waveform_data"
+  if waveform_conditioning:
+    modifier += "/waveform_conditioned"
+  else:
+    modifier += "/non_waveform_conditioned"
+if use_clinical_data:
+  modifier += "/clinical_data"
+  if clinical_conditioning:
+    modifier += "/clinical_conditioned"
+  else:
+    modifier += "/non_clinical_conditioned"
+  
+if use_pretrained_vital_encoder_weights:
+  modifier += "/forecasing_with_pretrained_vital_encoders"
+
+test_num = 2 #CHANGE - Vital Only: 7, Pretrained: 2, Clincal Data + Conditioned: 2, Clincal Data + Not Conditioned: 2
+save_path = f'../../models/Diffusion{modifier}/test_{test_num}'
+if not os.path.exists(save_path):
+  os.makedirs(f'{save_path}', exist_ok=True)
 train_state_save_path = f'{save_path}/train_checkpoint.pth'
 model_save_path = f'{save_path}/model.pth'
 batch_size = 512 #2048
+if use_waveform_data:
+  batch_size = 256
 num_epochs = 50
 vitals = ['HR', 'RESP', 'SpO2']
 
-log_path = '../../logs/Diffusion'
-os.makedirs(f'{log_path}/figures', exist_ok=True)
-os.makedirs(f'{log_path}/figures/HR', exist_ok=True)
-os.makedirs(f'{log_path}/figures/RESP', exist_ok=True)
-os.makedirs(f'{log_path}/figures/SpO2', exist_ok=True)
+log_path = f'../../logs/Diffusion{modifier}/test_{test_num}'
+if not os.path.exists(log_path):
+  os.makedirs(f'{log_path}/figures', exist_ok=True)
+  os.makedirs(f'{log_path}/figures/HR', exist_ok=True)
+  os.makedirs(f'{log_path}/figures/RESP', exist_ok=True)
+  os.makedirs(f'{log_path}/figures/SpO2', exist_ok=True)
+
+#Pretrained vital encoder paths
+hr_encoder_pretrained_weights = '../../models/Diffusion/pretrained_vital_encoders/test_1/HR/model.pth'
+resp_encoder_pretrained_weights = '../../models/Diffusion/pretrained_vital_encoders/test_1/RESP/model.pth'
+spO2_encoder_pretrained_weights = '../../models/Diffusion/pretrained_vital_encoders/test_1/SpO2/model.pth'
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 #1. Load and Process Data
-train_df, test_df = process_dataset(test_mode=False) 
+if use_waveform_data:
 
-#Normalize Data and Save Scaler
-print("loading datasets...")
-scaler = VitalScaler()
-scaler.fit(train_df)
-joblib.dump(scaler, f'{save_path}/vital_scaler.pkl')
+  vital_df, waveform_df = process_waveform_dataset(waveform_conditioning=waveform_conditioning, test_mode=False) 
+  
+  #Normalize Data and Save Scaler
+  print("loading datasets...")
+  vital_scaler = VitalScaler()
+  vital_scaler.fit(vital_df)
+  scaler = vital_scaler
+  joblib.dump(vital_scaler, f'{save_path}/vital_scaler.pkl')
+  waveform_scaler = WaveformScaler()
+  waveform_scaler.fit(waveform_df)
+  joblib.dump(waveform_scaler, f'{save_path}/waveform_scaler.pkl')
 
-train_df = scaler.transform(train_df)
-test_df = scaler.transform(test_df)
+  #Create Datasets
+  train_dataset = DiffusionTimeSeriesWaveformDataset(vital_scaler, waveform_scaler, include_waveform_data=waveform_conditioning, test=False)
+  test_dataset = DiffusionTimeSeriesWaveformDataset(vital_scaler, waveform_scaler, include_waveform_data=waveform_conditioning, test=True)
+elif use_clinical_data:
+  train_vital_df, test_vital_df, train_clinical_df, test_clinical_df = process_clinical_dataset(test_mode=False) 
 
-#Create Datasets
-train_dataset = DiffusionTimeSeriesDataset(train_df)
-test_dataset = DiffusionTimeSeriesDataset(test_df)
+  #Normalize Data and Save Scaler
+  print("loading datasets...")
+  scaler = VitalScaler()
+  scaler.fit(train_vital_df)
+  joblib.dump(scaler, f'{save_path}/vital_scaler.pkl')
+
+  train_vital_df = scaler.transform(train_vital_df)
+  test_vital_df = scaler.transform(test_vital_df)
+
+  #Create Datasets
+  train_dataset = DiffusionTimeSeriesClinicalConditionedDataset(train_vital_df, train_clinical_df, include_clinical_data=clinical_conditioning)
+  test_dataset = DiffusionTimeSeriesClinicalConditionedDataset(test_vital_df, test_clinical_df, include_clinical_data=clinical_conditioning)
+else:
+  train_df, test_df = process_dataset(test_mode=False) 
+
+  #Normalize Data and Save Scaler
+  print("loading datasets...")
+  scaler = VitalScaler()
+  scaler.fit(train_df)
+  joblib.dump(scaler, f'{save_path}/vital_scaler.pkl')
+
+  train_df = scaler.transform(train_df)
+  test_df = scaler.transform(test_df)
+
+  #Create Datasets
+  train_dataset = DiffusionTimeSeriesDataset(train_df)
+  test_dataset = DiffusionTimeSeriesDataset(test_df)
 
 
 print(f'Training Examples: {len(train_dataset.windows)}')
@@ -342,7 +449,7 @@ test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
 
 
 #2. Create Model
-model = DiffusionForecaster(num_vitals=3, prediction_length=10, embed_dim=256, num_heads=4, num_layers=4) #256, 4, 4
+model = DiffusionForecaster(num_vitals=3, prediction_length=10, embed_dim=256, num_heads=4, num_layers=4, waveform_conditioning=waveform_conditioning, clinical_conditioning=clinical_conditioning, use_pretrained_vital_encoder_weights=use_pretrained_vital_encoder_weights, hr_encoder_pretrained_weights=hr_encoder_pretrained_weights, resp_encoder_pretrained_weights=resp_encoder_pretrained_weights, spO2_encoder_pretrained_weights=spO2_encoder_pretrained_weights) #256, 4, 4
 model.to(device)
 
 optimizer = AdamW(
@@ -351,6 +458,45 @@ optimizer = AdamW(
   weight_decay=1e-4, 
   betas=(0.9, 0.999)
 ) 
+if use_pretrained_vital_encoder_weights:
+  non_vital_encoder_parameters = []
+  for name, param in model.named_parameters():
+      if 'hr_encoder' not in name and 'resp_encoder' not in name and 'spO2_encoder' not in name:
+          non_vital_encoder_parameters.append(param)
+
+  optimizer = AdamW([
+    {
+      "params":non_vital_encoder_parameters, 
+      "lr":1e-4, 
+      "weight_decay":1e-4, 
+      "betas":(0.9, 0.999)
+    },
+    {
+      "params":model.hr_encoder.parameters(), 
+      "lr":1e-5, 
+      "weight_decay":1e-4, 
+      "betas":(0.9, 0.999)
+    },
+    {
+      "params":model.resp_encoder.parameters(), 
+      "lr":1e-5, 
+      "weight_decay":1e-4, 
+      "betas":(0.9, 0.999)
+    },
+    {
+      "params":model.spO2_encoder.parameters(), 
+      "lr":1e-5, 
+      "weight_decay":1e-4, 
+      "betas":(0.9, 0.999)
+    }
+  ]) 
+else:
+  optimizer = AdamW(
+    model.parameters(), 
+    lr=1e-4, 
+    weight_decay=1e-4, 
+    betas=(0.9, 0.999)
+  ) 
 
 #Load Weights if Resuming
 if os.path.exists(train_state_save_path):
@@ -371,10 +517,10 @@ diff_scheduler = DiffusionScheduler(device, T=400)
 print('training...')
 for epoch in range(start_epoch, num_epochs):
   #train step
-  train_loss = train(model=model, train_loader=train_loader, optimizer=optimizer, diff_scheduler=diff_scheduler, model_save_path=model_save_path, train_state_save_path=train_state_save_path, epoch=epoch, epochs=num_epochs, device=device)
+  train_loss = train(model=model, train_loader=train_loader, waveform_conditioning=waveform_conditioning, clinical_conditioning=clinical_conditioning, optimizer=optimizer, diff_scheduler=diff_scheduler, model_save_path=model_save_path, train_state_save_path=train_state_save_path, epoch=epoch, epochs=num_epochs, device=device)
 
   #test step
-  test_metrics = evaluate(model=model, scaler=scaler, test_loader=test_loader, diff_scheduler=diff_scheduler, epoch=epoch, log_path=log_path, vitals=vitals, device=device)
+  test_metrics = evaluate(model=model, scaler=scaler, test_loader=test_loader, waveform_conditioning=waveform_conditioning, clinical_conditioning=clinical_conditioning, diff_scheduler=diff_scheduler, epoch=epoch, log_path=log_path, vitals=vitals, device=device)
 
 
   log_string = f'Epoch {epoch}: Train Loss - {train_loss}'

@@ -17,7 +17,7 @@ def compute_mae(mean_sample, target, vitals):
         target_i = target[..., i]
 
         # MAE
-        mae = np.mean(np.abs(pred_i - target_i))
+        mae = np.mean(np.abs(pred_i - target_i), axis=1) #np.mean(np.abs(pred_i - target_i))
 
         maes[vital] = mae
 
@@ -50,6 +50,6 @@ def compute_crps(samples, target, vitals):
 
         crps = term1 - 0.5 * term2
 
-        crpss[vital] = np.mean(crps)
+        crpss[vital] = np.mean(crps, axis=1)#np.mean(crps)
 
     return crpss
